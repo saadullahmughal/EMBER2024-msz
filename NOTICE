@@ -1,0 +1,21 @@
+EMBER2024 - Low-End Device Fork
+================================
+
+This product is based on EMBER2024 (https://github.com/FutureComputing4AI/EMBER2024).
+
+Original Authors:
+    Robert J. Joyce, Gideon Miller, Phil Roth, Richard Zak,
+    Elliott Zaresky-Williams, Hyrum Anderson, Edward Raff, James Holt
+
+Reference:
+    Joyce et al., "EMBER2024 - A Benchmark Dataset for Holistic Evaluation
+    of Malware Classifiers", KDD 2025. https://arxiv.org/pdf/2506.05074
+
+Modifications by:
+    M Saadullah Zafar, 2026
+    - model.py: refactored for low-end device and batch processing compatibility
+    - features.py: updated for signify 0.9.2 API compatibility
+    - pyproject.toml: dependencies pinned to exact tested versions, Python >=3.12.10
+    - setup.cfg: synced with pyproject.toml; corrected name, version, and
+      python_requires; removed build-time packages from install_requires
+    See CHANGES.md for full technical details.

@@ -4,6 +4,24 @@ EMBER2024 is an update to the [EMBER2017 and EMBER2018](https://github.com/elast
 
 For more details, check out our [paper](https://arxiv.org/pdf/2506.05074)!
 
+---
+
+> **Fork Notice** — This is a personal research fork of
+> [EMBER2024](https://github.com/FutureComputing4AI/EMBER2024) by M Saadullah Zafar (2026).
+> Original authors: Robert J. Joyce, Gideon Miller, Phil Roth, Richard Zak,
+> Elliott Zaresky-Williams, Hyrum Anderson, Edward Raff, and James Holt.
+>
+> **Changes in this fork:**
+> - Refactored `model.py` for low-end device and batch processing compatibility
+> - Updated `features.py` for signify 0.9.2 API compatibility
+> - Extended `create_vectorized_features` with new parameters (see [usage below](#additional-options-this-fork))
+> - Bug fix: `read_metadata` challenge set now reads from correct records
+> - Dependencies pinned to tested versions in `pyproject.toml` and `setup.cfg`; requires Python 3.12.10
+>
+> See [CHANGES.md](CHANGES.md) for full technical details.
+
+---
+
 
 ## EMBER2024 Contents
 
@@ -30,13 +48,22 @@ The previous EMBER feature versions were pinned to [LIEF](lief.re) version 0.9.0
 
 ## Installation
 
+This fork requires Python 3.12.10 and was developed on Windows 11 (x64).
+
 To clone the repository and install it using pip, run:
 ```
-git clone https://github.com/FutureComputing4AI/EMBER2024.git
+git clone https://github.com/[your-username]/EMBER2024.git
 cd EMBER2024/
 pip install .
 ```
 
+All dependencies are pinned to exact tested versions. It is strongly recommended
+to install into a fresh virtual environment:
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install .
+```
 
 ## Download Models and Dataset
 
@@ -121,6 +148,36 @@ By default, any families, behaviors, etc. that occur fewer than 10 times in EMBE
 
 ```
 thrember.create_vectorized_features('/path/to/dataset/', label_type="family", class_min=1)
+```
+
+### Additional Options (this fork)
+
+Write vectorized outputs to a separate directory:
+```python
+thrember.create_vectorized_features('/path/to/dataset/', out_dir='/path/to/output/')
+```
+
+Vectorize only specific subsets instead of all three:
+```python
+thrember.create_vectorized_features('/path/to/dataset/', subsets=["train", "test"])
+thrember.create_vectorized_features('/path/to/dataset/', subsets="challenge")
+```
+
+Use a pre-saved label map instead of deriving one from the data:
+```python
+thrember.create_vectorized_features('/path/to/dataset/', label_type="family",
+                                     label_map_json='/path/to/label_map_family.json')
+```
+
+Drop samples that have no label in the finalized label map:
+```python
+thrember.create_vectorized_features('/path/to/dataset/', label_type="behavior",
+                                     filter_to_final_labels=True)
+```
+
+Pass raw JSON lines directly instead of file paths (useful for low-memory batch workflows):
+```python
+thrember.vectorize_subset(X_path, y_path, raw_json_lines, extractor, nrows)
 ```
 
 ## Reading EMBER Vectors

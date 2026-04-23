@@ -1,3 +1,27 @@
+# Original work by Robert J. Joyce, Gideon Miller, Phil Roth, Richard Zak,
+# Elliott Zaresky-Williams, Hyrum Anderson, Edward Raff, and James Holt.
+# Source: https://github.com/FutureComputing4AI/EMBER2024
+# Reference: Joyce et al., "EMBER2024 - A Benchmark Dataset for Holistic
+# Evaluation of Malware Classifiers", KDD 2025.
+#
+# Licensed under the Apache License, Version 2.0.
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Modified by M Saadullah Zafar, 2026
+# Changes made to this file:
+#   - vectorize_subset: accepts both file Paths and in-memory JSON line lists
+#   - create_vectorized_features: added out_dir, filter_to_final_labels,
+#     label_map_json, and subsets parameters
+#   - Output paths now respect out_dir; directory is auto-created
+#   - Subset vectorization is now selective (train/test/challenge)
+#   - Label-map logic redesigned: supports loading from JSON, combines counts
+#     across subsets, filters by class_min, assigns IDs via alphabetical sort,
+#     and saves to label_map_<label_type>.json
+#   - New filter_to_final_labels step drops samples lacking finalized labels
+#   - Challenge vectorization now correctly passes label_type and label_map
+#   - read_metadata bug fix: challenge DataFrame now built from challenge_records
+#     instead of test_records
+
 import os
 import json
 import multiprocessing
@@ -62,7 +86,6 @@ def gather_feature_paths(data_dir: Path | str, subset: str, filetype: str = None
     if not len(feature_paths):
         raise ValueError("Did not find any .jsonl files matching criteria")
     return feature_paths
-
 
 
 def read_label(raw_features_string: str, label_type: str) -> str:
@@ -145,9 +168,21 @@ def vectorize_unpack(args):
     return vectorize(*args)
 
 
-def vectorize_subset(X_path: Path, y_path: Path, raw_feature_paths: list[Path], extractor: PEFeatureExtractor, nrows: int, label_type: str = "label", label_map: dict = {}) -> None:
+def vectorize_subset(
+    X_path: Path,
+    y_path: Path,
+    raw_feature_paths: list,
+    extractor: PEFeatureExtractor,
+    nrows: int,
+    label_type: str = "label",
+    label_map: dict = {},
+) -> None:
     """
-    Vectorize a subset of data and write it to disk
+    Vectorize a subset of data and write it to disk.
+
+    `raw_feature_paths` may be a list of `Path` objects (files containing jsonl lines)
+    or an in-memory list of raw json lines (strings). The function determines which
+    and enumerates accordingly.
     """
     # Create space on disk to write features to
     X = np.memmap(X_path, dtype=np.float32, mode="w+", shape=(nrows, extractor.dim))
@@ -159,24 +194,59 @@ def vectorize_subset(X_path: Path, y_path: Path, raw_feature_paths: list[Path], 
 
     # Distribute the vectorization work
     pool = multiprocessing.Pool()
+    # Accept either a list of file Paths or an in-memory list of raw feature strings
+    if len(raw_feature_paths) and isinstance(raw_feature_paths[0], Path):
+        iterator = enumerate(raw_feature_iterator(raw_feature_paths))
+    else:
+        iterator = enumerate(raw_feature_paths)
+
     argument_iterator = (
-        (irow, raw_features_string, X_path, y_path, extractor, nrows, label_type, label_map)
-        for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths))
+        (
+            irow,
+            raw_features_string,
+            X_path,
+            y_path,
+            extractor,
+            nrows,
+            label_type,
+            label_map,
+        )
+        for irow, raw_features_string in iterator
     )
     for _ in tqdm.tqdm(pool.imap_unordered(vectorize_unpack, argument_iterator), total=nrows):
         pass
 
 
-def create_vectorized_features(data_dir: Path | str, label_type: str = "label", class_min: int = 10) -> None:
+def create_vectorized_features(
+    data_dir: Path | str,
+    out_dir: Path | str | None = None,
+    label_type: str = "label",
+    class_min: int = 10,
+    filter_to_final_labels: bool = False,
+    label_map_json: Path | str | None = None,
+    subsets: list[str] | str | None = None,
+) -> None:
     """
     Create feature vectors from raw features and write them to disk
 
     Arguments:
     data_dir - Path to the directory containing the dataset.
+    out_dir - Optional path where vectorized outputs and label map are written.
+              If None, outputs are written into `data_dir`.
     label_type - The type of classification problem.
     class_min - The minimum number of instances of a class in the dataset. Data
                 points belonging to a class with fewer than class_min instances
                 are ignored.
+    filter_to_final_labels - If True and `label_type != "label"`, only samples
+                that have at least one label present in the finalized `label_map`
+                are retained for vectorization. Defaults to False (current behavior).
+    label_map_json - Optional Path to a saved label map JSON file. If provided
+                and `label_type != "label"`, this mapping will be used instead of
+                deriving it from the dataset. The file must contain a JSON object
+                mapping string labels to integer ids (e.g., {"ransomware": 0}).
+    subsets - Optional subset or list of subsets to vectorize. Valid values are
+                'train', 'test', and 'challenge'. If None (default), all three
+                subsets will be vectorized.
 
     Valid label_types:
     label - malicious/benign (binary)
@@ -192,58 +262,177 @@ def create_vectorized_features(data_dir: Path | str, label_type: str = "label", 
 
     extractor = PEFeatureExtractor()
     data_path: Path = Path(data_dir)
+    out_path: Path = Path(out_dir) if out_dir is not None else data_path
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Sanity check: label_map_json only applies to non-binary label types
+    if label_map_json is not None and label_type == "label":
+
+        raise ValueError(
+            "label_map_json is only valid for non-binary label types (label_type != 'label')"
+        )
+
+    def sample_has_final_label(
+        raw_features_string: str, label_type: str, label_map: dict
+    ) -> bool:
+        """Return True if the sample has at least one finalized label present in label_map."""
+        raw = json.loads(raw_features_string)
+        if label_type not in raw:
+            return False
+        label = raw[label_type]
+        if label is None:
+            return False
+        if isinstance(label, int):
+            return True
+        if isinstance(label, str):
+            return label in label_map
+        if isinstance(label, list):
+            return any(lbl in label_map for lbl in label)
+        return False
 
     print("Preparing to vectorize raw features")
-    X_train_path = data_path / "X_train.dat"
-    y_train_path = data_path / "y_train.dat"
-    train_feature_paths = gather_feature_paths(data_path, "train")
-    train_nrows = sum([1 for fp in train_feature_paths for _ in fp.open()])
 
-    X_test_path = data_path / "X_test.dat"
-    y_test_path = data_path / "y_test.dat"
-    test_feature_paths = gather_feature_paths(data_path, "test")
-    test_nrows = sum([1 for fp in test_feature_paths for _ in fp.open()])
+    # Normalize subsets parameter
+    allowed_subsets = {"train", "test", "challenge"}
+    if subsets is None:
+        selected_subsets = ["train", "test", "challenge"]
+    elif isinstance(subsets, str):
+        selected_subsets = [subsets]
+    else:
+        selected_subsets = list(subsets)
+    for s in selected_subsets:
+        if s not in allowed_subsets:
+            raise ValueError(
+                f"Invalid subset '{s}' in subsets. Allowed: {allowed_subsets}"
+            )
+
+    if not selected_subsets:
+        raise ValueError(
+            "No subsets selected; choose from 'train', 'test', 'challenge'"
+        )
+
+    print(f"Vectorizing subsets: {selected_subsets}")
+
+    # Gather paths and counts only for requested subsets
+    feature_paths = {}
+    nrows = {}
+    if "train" in selected_subsets:
+        feature_paths["train"] = gather_feature_paths(data_path, "train")
+        nrows["train"] = sum([1 for fp in feature_paths["train"] for _ in fp.open()])
+    if "test" in selected_subsets:
+        feature_paths["test"] = gather_feature_paths(data_path, "test")
+        nrows["test"] = sum([1 for fp in feature_paths["test"] for _ in fp.open()])
+    if "challenge" in selected_subsets:
+        feature_paths["challenge"] = gather_feature_paths(data_path, "challenge")
+        nrows["challenge"] = sum(
+            [1 for fp in feature_paths["challenge"] for _ in fp.open()]
+        )
 
     # Map string labels/tags to numeric labels
     label_map = {}
-    i = 0
     if label_type != "label": # No work needed for the default malicious/benign labels
-        train_label_counts = read_label_subset(train_feature_paths, train_nrows, label_type)
+        # If a saved label map JSON is provided, load and use it
+        if label_map_json is not None:
+            # Allow passing either a dict directly or a path to a JSON file
+            if isinstance(label_map_json, dict):
+                label_map = label_map_json
+            else:
+                label_map_path = Path(label_map_json)
+                if not label_map_path.is_file():
+                    raise ValueError(
+                        f"Provided label_map_json does not exist: {label_map_path}"
+                    )
+                with label_map_path.open("r") as f:
+                    label_map = json.load(f)
+            if not isinstance(label_map, dict) or not all(
+                isinstance(k, str) and isinstance(v, int) for k, v in label_map.items()
+            ):
+                raise ValueError(
+                    "Loaded label_map_json must be a dict mapping string labels to integer ids"
+                )
+        else:
+            # Read label counts for the selected subsets and build a combined mapping
+            combined_counts = {}
+            for s in selected_subsets:
+                counts = read_label_subset(feature_paths[s], nrows[s], label_type)
+                for lbl, cnt in counts.items():
+                    combined_counts[lbl] = combined_counts.get(lbl, 0) + cnt
 
-        # Remove labels/tags that appear fewer than class_min time
-        for l, count in train_label_counts.items():
-            if l in ignore_tags:
-                continue
-            if count >= class_min:
-                label_map[l] = i
-                i += 1
+            # Collect labels that meet class_min and are not ignored
+            included_labels = set()
+            for label, count in combined_counts.items():
+                if label in ignore_tags:
+                    continue
+                if count >= class_min:
+                    included_labels.add(label)
 
-    print("Vectorizing training set")
-    vectorize_subset(X_train_path, y_train_path, train_feature_paths, extractor, train_nrows, label_type, label_map)
+            # Sort labels alphabetically before assigning numeric labels
+            sorted_labels = sorted(included_labels)
+            label_map = {lbl: idx for idx, lbl in enumerate(sorted_labels)}
 
-    if label_type != "label": # No work needed for the default malicious/benign labels
-        test_label_counts = read_label_subset(test_feature_paths, test_nrows, label_type)
+            # Save label mapping as JSON
+            label_map_path = out_path / f"label_map_{label_type}.json"
+            with label_map_path.open("w") as f:
+                json.dump(label_map, f, indent=2)
 
-        # Remove labels/tags that appear fewer than class_min time
-        for l, count in test_label_counts.items():
-            if l in ignore_tags:
-                continue
-            if label_map.get(l) is not None:
-                continue
-            if count >= class_min:
-                label_map[l] = i
-                i += 1
+        # Optionally filter the selected datasets to only samples that contain at least one of the
+        # finalized labels in `label_map`. This ensures only relevant samples are counted.
+        if filter_to_final_labels:
+            for s in list(feature_paths.keys()):
+                filtered = [
+                    line
+                    for line in raw_feature_iterator(feature_paths[s])
+                    if sample_has_final_label(line, label_type, label_map)
+                ]
+                feature_paths[s] = filtered
+                nrows[s] = len(filtered)
+                if nrows[s] == 0:
+                    raise ValueError(
+                        f"No {s} samples remain after filtering to finalized labels"
+                    )
 
-    print("Vectorizing test set")
-    vectorize_subset(X_test_path, y_test_path, test_feature_paths, extractor, test_nrows, label_type, label_map)
+    # Vectorize only the requested subsets
+    if "train" in selected_subsets:
+        print("Vectorizing training set")
+        X_train_path = out_path / "X_train.dat"
+        y_train_path = data_path / "y_train.dat"
+        vectorize_subset(
+            X_train_path,
+            y_train_path,
+            feature_paths["train"],
+            extractor,
+            nrows["train"],
+            label_type,
+            label_map,
+        )
 
-    print("Vectorizing challenge set")
-    X_test_path = data_path / "X_challenge.dat"
-    y_test_path = data_path / "y_challenge.dat"
-    raw_feature_paths = gather_feature_paths(data_path, "challenge")
-    nrows = sum([1 for fp in raw_feature_paths for _ in fp.open()])
-    vectorize_subset(X_test_path, y_test_path, raw_feature_paths, extractor, nrows)
+    if "test" in selected_subsets:
+        print("Vectorizing test set")
+        X_test_path = out_path / "X_test.dat"
+        y_test_path = out_path / "y_test.dat"
+        vectorize_subset(
+            X_test_path,
+            y_test_path,
+            feature_paths["test"],
+            extractor,
+            nrows["test"],
+            label_type,
+            label_map,
+        )
 
+    if "challenge" in selected_subsets:
+        print("Vectorizing challenge set")
+        X_challenge_path = out_path / "X_challenge.dat"
+        y_challenge_path = out_path / "y_challenge.dat"
+        vectorize_subset(
+            X_challenge_path,
+            y_challenge_path,
+            feature_paths["challenge"],
+            extractor,
+            nrows["challenge"],
+            label_type,
+            label_map,
+        )
 
 
 def read_vectorized_features(data_dir: Path | str, subset: str = "train") -> tuple[np.ndarray, np.ndarray]:
@@ -298,7 +487,11 @@ def read_metadata(data_dir: Path | str) -> pl.DataFrame:
 
     challenge_feature_paths = gather_feature_paths(data_path, "challenge")
     challenge_records = list(pool.imap(read_metadata_record, raw_feature_iterator(challenge_feature_paths)))
-    challenge_metadf = pl.DataFrame(test_records).with_columns(subset=pl.lit("challenge")).select(ORDERED_COLUMNS)
+    challenge_metadf = (
+        pl.DataFrame(challenge_records)
+        .with_columns(subset=pl.lit("challenge"))
+        .select(ORDERED_COLUMNS)
+    )
 
     return train_metadf, test_metadf, challenge_metadf
 
